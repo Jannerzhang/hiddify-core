@@ -3,11 +3,14 @@ package config
 import (
 	context "context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"math/rand"
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	sync "sync"
 	"time"
@@ -685,48 +688,101 @@ func setRoutingOptions(options *option.Options, hopt *HiddifyOptions) error {
 		)
 	}
 
-	// for _, rule := range opt.Rules {
-	// 	routeRule := rule.MakeRule()
-	// 	switch rule.Outbound {
-	// 	case "bypass":
-	// 		routeRule.Outbound = OutboundBypassTag
-	// 	case "block":
-	// 		routeRule.Outbound = OutboundBlockTag
-	// 	case "proxy":
-	// 		routeRule.Outbound = OutboundMainProxyTag
-	// 	}
 
-	// 	if routeRule.IsValid() {
-	// 		routeRules = append(
-	// 			routeRules,
-	// 			option.Rule{
-	// 				Type:           C.RuleTypeDefault,
-	// 				DefaultOptions: routeRule,
-	// 			},
-	// 		)
-	// 	}
+	for _, rule := range hopt.Rules {
+		routeRule := option.DefaultRule{
+			RuleAction: option.RuleAction{
+				Action: C.RuleActionTypeRoute,
+				RouteOptions: option.RouteActionOptions{},
+			},
+		}
+		if len(rule.Domains) > 0 {
+			routeRule.DomainSuffix = append(routeRule.DomainSuffix, rule.Domains...)
+		}
+		if len(rule.IpCidrs) > 0 {
+			routeRule.IPCIDR = append(routeRule.IPCIDR, rule.IpCidrs...)
+		}
+		
+		switch rule.Outbound {
+		case Outbound_direct:
+			routeRule.RouteOptions.Outbound = OutboundDirectTag
+		case Outbound_block:
+			routeRule.RouteOptions.Outbound = "block"
+		case Outbound_proxy:
+			routeRule.RouteOptions.Outbound = OutboundMainDetour
+		}
 
-	// 	dnsRule := rule.MakeDNSRule()
-	// 	switch rule.Outbound {
-	// 	case "bypass":
-	// 		dnsRule.Server = DNSDirectTag
-	// 	case "block":
-	// 		dnsRule.Server = DNSBlockTag
-	// 		dnsRule.DisableCache = true
-	// 	case "proxy":
-	// 		if opt.EnableFakeDNS {
-	// 			fakeDnsRule := dnsRule
-	// 			fakeDnsRule.Server = DNSFakeTag
-	// 			fakeDnsRule.Inbound = []string{InboundTUNTag, InboundMixedTag}
-	// 			dnsRules = append(dnsRules, fakeDnsRule)
-	// 		}
-	// 		dnsRule.Server = DNSRemoteTag
-	// 	}
-	// 	dnsRules = append(dnsRules, dnsRule)
-	// }
+		routeRules = append(
+			routeRules,
+			option.Rule{
+				Type:           C.RuleTypeDefault,
+				DefaultOptions: routeRule,
+			},
+		)
+	}
+
+
 	forceDirectRoute := make([]string, 0)
 	if options.NTP != nil && options.NTP.Enabled {
 		forceDirectRoute = append(forceDirectRoute, options.NTP.Server)
+	}
+
+	cwd, _ := os.Getwd()
+	remoteRulesPath := filepath.Join(cwd, "remote_routing.json")
+	if data, err := os.ReadFile(remoteRulesPath); err == nil {
+		var rawRules []json.RawMessage
+		if err := json.Unmarshal(data, &rawRules); err == nil {
+			// To keep OTA rules at highest priority, we accumulate them and prepend later.
+			var otaRouteRules []option.Rule
+			var otaDNSRules []option.DefaultDNSRule
+			
+			// Custom struct to parse flat DNS rules
+			type OTADNSRule struct {
+				option.RawDefaultDNSRule
+				Server     string  `json:"server"`
+				RewriteTTL *uint32 `json:"rewrite_ttl"`
+			}
+			
+			for _, raw := range rawRules {
+				var m map[string]interface{}
+				if err := json.Unmarshal(raw, &m); err == nil {
+					if _, hasServer := m["server"]; hasServer {
+						var ota OTADNSRule
+						if err := json.Unmarshal(raw, &ota); err == nil {
+							dnsRule := option.DefaultDNSRule{
+								RawDefaultDNSRule: ota.RawDefaultDNSRule,
+								DNSRuleAction: option.DNSRuleAction{
+									Action: C.RuleActionTypeRoute,
+									RouteOptions: option.DNSRouteActionOptions{
+										Server:     ota.Server,
+										RewriteTTL: ota.RewriteTTL,
+									},
+								},
+							}
+							otaDNSRules = append(otaDNSRules, dnsRule)
+						} else {
+							os.WriteFile(filepath.Join(cwd, "DEBUG_OTA_ERR.txt"), []byte("DNS err: "+err.Error()), 0644)
+						}
+					} else {
+						var routeRule option.Rule
+						if err := json.Unmarshal(raw, &routeRule); err == nil {
+							otaRouteRules = append(otaRouteRules, routeRule)
+						} else {
+							os.WriteFile(filepath.Join(cwd, "DEBUG_OTA_ERR.txt"), []byte("Route err: "+err.Error()), 0644)
+						}
+					}
+				}
+			}
+			
+			// Dump what we parsed
+			dbg := fmt.Sprintf("Found %d DNS rules, %d Route rules", len(otaDNSRules), len(otaRouteRules))
+			os.WriteFile(filepath.Join(cwd, "DEBUG_OTA_PARSE.txt"), []byte(dbg), 0644)
+
+			// Prepend route rules
+			routeRules = append(otaRouteRules, routeRules...)
+			// Prepend DNS rules to dnsRules list
+			dnsRules = append(otaDNSRules, dnsRules...)
+		}
 	}
 
 	// parsedURL, err := url.Parse(opt.ConnectionTestUrl)
