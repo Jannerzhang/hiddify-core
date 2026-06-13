@@ -2,6 +2,8 @@ module github.com/hiddify/hiddify-core
 
 go 1.25.6
 
+toolchain go1.26.4
+
 require (
 	github.com/bepass-org/warp-plus v1.2.6
 	github.com/improbable-eng/grpc-web v0.15.0
